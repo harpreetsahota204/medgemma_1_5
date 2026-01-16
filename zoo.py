@@ -155,12 +155,16 @@ class medgemma(Model, SamplesMixin, SupportsGetItem, TorchModelMixin):
             "device_map": self.device,
         }
         
+        # Determine dtype for inference (used by both model and processor inputs)
+        self._inference_dtype = None
+        
         # Set optimizations based on CUDA device capabilities
         if self.device == "cuda" and torch.cuda.is_available():
             capability = torch.cuda.get_device_capability(self.device)
             # Enable bfloat16 on Ampere+ GPUs (compute capability 8.0+)
             if capability[0] >= 8:
                 model_kwargs["torch_dtype"] = torch.bfloat16
+                self._inference_dtype = torch.bfloat16
             
             # Only apply quantization if device is CUDA
             if self.quantized:
@@ -400,7 +404,7 @@ class medgemma(Model, SamplesMixin, SupportsGetItem, TorchModelMixin):
             }
         ]
 
-        text = self.processor.apply_chat_template(
+        inputs = self.processor.apply_chat_template(
             messages, 
             tokenize=True, 
             add_generation_prompt=True,
@@ -408,17 +412,20 @@ class medgemma(Model, SamplesMixin, SupportsGetItem, TorchModelMixin):
             return_dict=True,
         )
         
-        # Move tensors to the device
-        if self.device == "cuda":
-            text = {k: v.to(self.device, dtype=torch.bfloat16) for k, v in text.items()}
+        # Move to device with appropriate dtype for floating point tensors
+        # BatchFeature's .to() method intelligently handles dtypes:
+        # - Integer tensors (input_ids) stay as Long
+        # - Floating point tensors (pixel_values) convert to specified dtype
+        if self._inference_dtype is not None:
+            inputs = inputs.to(self.device, dtype=self._inference_dtype)
         else:
-            text = {k: v.to(self.device) for k, v in text.items()}
+            inputs = inputs.to(self.device)
 
-        input_len = text["input_ids"].shape[-1]
+        input_len = inputs["input_ids"].shape[-1]
 
         with torch.inference_mode():
             generation = self.model.generate(
-                **text, 
+                **inputs, 
                 max_new_tokens=8192, 
                 do_sample=False
             )
