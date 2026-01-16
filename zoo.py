@@ -295,7 +295,9 @@ class medgemma(Model, SupportsGetItem, TorchModelMixin):
         ]
         
         # Batch process with padding
-        inputs = self.processor(text=texts, images=images, padding=True, return_tensors="pt")
+        # Gemma3 processor expects images as list of lists (one list per text entry)
+        batched_images = [[img] for img in images]
+        inputs = self.processor(text=texts, images=batched_images, padding=True, return_tensors="pt")
         
         if self._inference_dtype:
             inputs = inputs.to(self.model.device, dtype=self._inference_dtype)
