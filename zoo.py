@@ -1,6 +1,5 @@
 import logging
-import os
-from typing import List, Dict, Any, Optional, Union, Tuple
+from typing import Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -9,8 +8,7 @@ import json
 
 import fiftyone as fo
 from fiftyone import Model
-from fiftyone.core.models import SamplesMixin, SupportsGetItem, TorchModelMixin
-from fiftyone.core.labels import Classification, Classifications
+from fiftyone.core.models import SupportsGetItem, TorchModelMixin
 from fiftyone.utils.torch import GetItem
 
 from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
@@ -43,7 +41,6 @@ DEFAULT_VQA_SYSTEM_PROMPT = """You are an expert radiologist, histopathologist, 
 You may be provided with a simple query, patient history with a complex query, asked to provide a medical diagnosis, or any variety of medical question.
 """
 
-
 MEDGEMMA_OPERATIONS = {
     "vqa": DEFAULT_VQA_SYSTEM_PROMPT,
     "classify": DEFAULT_CLASSIFICATION_SYSTEM_PROMPT
@@ -51,7 +48,7 @@ MEDGEMMA_OPERATIONS = {
 
 logger = logging.getLogger(__name__)
 
-# Utility functions
+
 def get_device():
     """Get the appropriate device for model inference."""
     if torch.cuda.is_available():
@@ -62,80 +59,27 @@ def get_device():
 
 
 class MedGemmaGetItem(GetItem):
-    """Transform for loading images and extracting prompts for MedGemma.
-    
-    This class handles data loading in DataLoader worker processes:
-    - Loads images from filepaths
-    - Extracts per-sample prompts if configured
-    """
+    """GetItem transform for loading images and extracting per-sample prompts."""
     
     def __init__(self, field_mapping=None, prompt_field=None):
-        """Initialize the GetItem transform.
-        
-        Args:
-            field_mapping: Optional dict mapping required_keys to dataset fields
-            prompt_field: Name of the field containing per-sample prompts
-        """
         self.prompt_field = prompt_field
         super().__init__(field_mapping=field_mapping)
-
-    # =========================================================================
-    # Context manager
-    # =========================================================================
-    
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-    
-    def __exit__(self, *args):
-        """Context manager exit - clear GPU memory."""
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        return False
     
     @property
     def required_keys(self):
-        """Return list of fields needed from each sample."""
         keys = ["filepath"]
-        if self.prompt_field is not None:
-            keys.append("prompt_field")
+        if self.prompt_field:
+            keys.append(self.prompt_field)
         return keys
     
     def __call__(self, sample_dict):
-        """Load and preprocess a single sample.
-        
-        Args:
-            sample_dict: Dict with keys from required_keys
-        
-        Returns:
-            Dict containing:
-                - "image": PIL Image loaded from filepath
-                - "prompt": Per-sample prompt (or None if not configured)
-        """
-        filepath = sample_dict["filepath"]
-        
-        # Load image (runs in parallel via DataLoader workers)
-        image = Image.open(filepath).convert("RGB")
-        
-        # Extract prompt from sample if available
-        prompt = None
-        if "prompt_field" in sample_dict:
-            prompt = sample_dict["prompt_field"]
-        
+        image = Image.open(sample_dict["filepath"]).convert("RGB")
+        prompt = sample_dict.get(self.prompt_field) if self.prompt_field else None
         return {"image": image, "prompt": prompt}
 
 
-class medgemma(Model, SamplesMixin, SupportsGetItem, TorchModelMixin):
-    """A FiftyOne model for running MedGemma vision tasks with batching support.
-    
-    Inheritance:
-        - Model: Base class with required interface
-        - SamplesMixin: Enables per-sample field access (for prompts)
-        - SupportsGetItem: Enables DataLoader-based batching
-        - TorchModelMixin: Provides custom collation for variable-size inputs
-    """
+class medgemma(Model, SupportsGetItem, TorchModelMixin):
+    """A FiftyOne model for running MedGemma vision tasks with batching support."""
 
     def __init__(
         self,
@@ -144,163 +88,127 @@ class medgemma(Model, SamplesMixin, SupportsGetItem, TorchModelMixin):
         prompt: str = None,
         system_prompt: str = None,
         quantized: bool = None,
+        max_new_tokens: int = 8192,
         **kwargs
     ):
-        # Initialize mixins
-        SamplesMixin.__init__(self)
         SupportsGetItem.__init__(self)
         
-        # Required for SamplesMixin - tracks fields needed from samples
-        self._fields = {}
-        
-        # Required for batching - preprocessing is handled by GetItem
         self._preprocess = False
+        self._fields = {}
         
         self.model_path = model_path
         self._custom_system_prompt = system_prompt
         self._operation = operation
-        self.prompt = prompt  # Global default prompt
+        self.prompt = prompt
         self.quantized = quantized
+        self.max_new_tokens = max_new_tokens
         
         self.device = get_device()
         logger.info(f"Using device: {self.device}")
 
-        # Base model kwargs that are always needed
         model_kwargs = {
             "trust_remote_code": True,
             "device_map": self.device,
         }
         
-        # Determine dtype for inference (used by both model and processor inputs)
         self._inference_dtype = None
         
-        # Set optimizations based on CUDA device capabilities
-        if self.device == "cuda" and torch.cuda.is_available():
-            capability = torch.cuda.get_device_capability(self.device)
-            # Enable bfloat16 on Ampere+ GPUs (compute capability 8.0+)
+        if self.device == "cuda":
+            capability = torch.cuda.get_device_capability()
             if capability[0] >= 8:
                 model_kwargs["torch_dtype"] = torch.bfloat16
                 self._inference_dtype = torch.bfloat16
+            else:
+                model_kwargs["torch_dtype"] = torch.float16
+                self._inference_dtype = torch.float16
             
-            # Only apply quantization if device is CUDA
             if self.quantized:
                 model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
-        elif self.quantized:
-            logger.warning("Quantization is only supported on CUDA devices. Ignoring quantization request.")
             
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            **model_kwargs
-        )
-        
-        logger.info("Loading processor")
-
-        self.processor = AutoProcessor.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            use_fast=True
-        )
-
+        self.model = AutoModelForImageTextToText.from_pretrained(model_path, **model_kwargs)
+        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True, use_fast=True)
         self.model.eval()
 
-    # ============ FROM Model BASE CLASS ============
+    # =========================================================================
+    # Context manager
+    # =========================================================================
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        return False
+
+    # =========================================================================
+    # Model base class requirements
+    # =========================================================================
 
     @property
     def media_type(self):
-        """The media type processed by the model."""
         return "image"
 
     @property
     def transforms(self):
-        """Preprocessing transforms applied to inputs.
-        
-        For SupportsGetItem models, preprocessing happens in GetItem,
-        so return None.
-        """
         return None
 
     @property
     def preprocess(self):
-        """Whether model should apply preprocessing."""
         return self._preprocess
 
     @preprocess.setter
     def preprocess(self, value):
-        """Allow FiftyOne to control preprocessing."""
         self._preprocess = value
 
     @property
     def ragged_batches(self):
-        """Whether this model supports batches with varying sizes.
-        
-        MUST return False to enable batching, even if your inputs
-        have variable sizes! Handle variable sizes via custom collate_fn.
-        """
         return False
 
-    # ============ FROM SamplesMixin ============
+    # =========================================================================
+    # Per-sample prompt field support
+    # =========================================================================
 
     @property
     def needs_fields(self):
-        """A dict mapping model-specific keys to sample field names."""
         return self._fields
-
+    
     @needs_fields.setter
     def needs_fields(self, fields):
         self._fields = fields
 
     def _get_field(self):
-        """Get the prompt field name from needs_fields."""
         if "prompt_field" in self.needs_fields:
             return self.needs_fields["prompt_field"]
         return next(iter(self.needs_fields.values()), None)
 
-    # ============ FROM TorchModelMixin ============
+    # =========================================================================
+    # TorchModelMixin requirements
+    # =========================================================================
 
     @property
     def has_collate_fn(self):
-        """Whether this model provides custom batch collation.
-        
-        Return True for variable-size inputs (images of different dimensions).
-        """
         return True
 
     @property
     def collate_fn(self):
-        """Custom collation function for batching.
-        
-        Returns items as a list without stacking, allowing variable-size images.
-        """
-        @staticmethod
-        def identity_collate(batch):
-            """Return list of items without stacking."""
-            return batch
-        return identity_collate
+        return lambda batch: batch
 
-    # ============ FROM SupportsGetItem ============
+    # =========================================================================
+    # SupportsGetItem requirements
+    # =========================================================================
+
+    def get_item(self):
+        return MedGemmaGetItem(prompt_field=self._get_field())
 
     def build_get_item(self, field_mapping=None):
-        """Build the GetItem transform for data loading.
-        
-        Args:
-            field_mapping: Optional dict mapping required_keys to dataset fields
-        
-        Returns:
-            MedGemmaGetItem instance configured for this model
-        """
-        # Extract prompt field name from field_mapping or _fields
-        prompt_field = None
-        if field_mapping and "prompt_field" in field_mapping:
-            prompt_field = field_mapping["prompt_field"]
-        elif "prompt_field" in self._fields:
-            prompt_field = self._fields["prompt_field"]
-        
-        return MedGemmaGetItem(
-            field_mapping=field_mapping,
-            prompt_field=prompt_field
-        )
+        return MedGemmaGetItem(field_mapping=field_mapping, prompt_field=self._get_field())
 
-    # ============ OPERATION AND PROMPT PROPERTIES ============
+    # =========================================================================
+    # Operation and prompt properties
+    # =========================================================================
 
     @property
     def operation(self):
@@ -308,260 +216,153 @@ class medgemma(Model, SamplesMixin, SupportsGetItem, TorchModelMixin):
 
     @operation.setter
     def operation(self, value):
-        if value not in MEDGEMMA_OPERATIONS:
-            raise ValueError(f"Invalid operation: {value}. Must be one of {list(MEDGEMMA_OPERATIONS.keys())}")
         self._operation = value
 
     @property
     def system_prompt(self):
-        """Return custom system prompt if set, otherwise return default for current operation."""
-        return self._custom_system_prompt if self._custom_system_prompt is not None else MEDGEMMA_OPERATIONS[self.operation]
+        if self._custom_system_prompt is not None:
+            return self._custom_system_prompt
+        return MEDGEMMA_OPERATIONS.get(self.operation, DEFAULT_VQA_SYSTEM_PROMPT)
 
     @system_prompt.setter
     def system_prompt(self, value):
         self._custom_system_prompt = value
 
-    # ============ HELPER METHODS ============
+    # =========================================================================
+    # Output formatting
+    # =========================================================================
 
     def _parse_json(self, s: str) -> Optional[Dict]:
-        """Parse JSON from model output.
-        
-        Args:
-            s: String output from the model to parse
-            
-        Returns:
-            Dict: Parsed JSON dictionary if successful
-            None: If parsing fails or input is invalid
-            Original input: If input is not a string
-        """
-        if not isinstance(s, str):
-            return s
-            
-        # Handle JSON wrapped in markdown code blocks
-        if "```json" in s:
-            try:
-                s = s.split("```json")[1].split("```")[0].strip()
-            except IndexError:
-                logger.debug("Failed to extract JSON from markdown blocks")
-                return None
-        
+        """Parse JSON from model output, handling markdown code blocks."""
         try:
+            if "```json" in s:
+                s = s.split("```json")[1].split("```")[0].strip()
             return json.loads(s)
-        except json.JSONDecodeError as e:
-            logger.debug(f"JSON parse error: {e}. First 200 chars: {s[:200]}")
+        except (json.JSONDecodeError, IndexError):
+            logger.debug(f"Failed to parse JSON from: {s[:200]}")
             return None
 
-    def _to_classifications(self, data: Dict) -> fo.Classifications:
-        """Convert JSON classification data to FiftyOne Classifications.
+    def _to_classifications(self, data: Optional[Dict]) -> fo.Classifications:
+        """Convert parsed JSON to FiftyOne Classifications."""
+        if data is None:
+            return fo.Classifications(classifications=[])
         
-        Args:
-            data: Dictionary containing a 'classifications' list where each item has:
-                - 'label': String class label
-            
-        Returns:
-            fo.Classifications object containing the converted classification annotations
-            
-        Example input:
-            {
-                "classifications": [
-                    {"label": "condition_1"},
-                    {"label": "condition_2"}
-                ]
-            }
-        """
         classifications = []
-        
-        try:
-            # Extract the classifications list from the input dictionary
-            classes = data.get("classifications", [])
-            
-            # Process each classification dictionary
-            for cls in classes:
-                try:
-                    if not isinstance(cls, dict) or "label" not in cls:
-                        logger.debug(f"Invalid classification format: {cls}")
-                        continue
-                        
-                    classification = fo.Classification(
-                        label=str(cls["label"]),
-                    )
-                    classifications.append(classification)
-
-                except Exception as e:
-                    logger.debug(f"Error processing classification {cls}: {e}")
-                    continue
-
-        except Exception as e:
-            logger.debug(f"Error processing classifications data: {e}")
-            
+        for cls in data.get("classifications", []):
+            if isinstance(cls, dict) and "label" in cls:
+                classifications.append(fo.Classification(label=str(cls["label"])))
         return fo.Classifications(classifications=classifications)
 
-    def _run_single_inference(self, image: Image.Image, prompt: str) -> str:
-        """Run inference on a single image with a prompt.
+    def _format_output(self, output_text: str) -> Union[fo.Classifications, str]:
+        """Format model output based on operation type."""
+        if self.operation == "classify":
+            return self._to_classifications(self._parse_json(output_text))
+        return output_text.strip()
+
+    # =========================================================================
+    # Prediction methods
+    # =========================================================================
+
+    def predict_all(self, batch, preprocess=None):
+        """Batch prediction with true batching via processor padding."""
+        if not batch:
+            return []
         
-        Args:
-            image: PIL Image to process
-            prompt: Text prompt for the model
-            
-        Returns:
-            str: Raw text output from the model
-        """
+        # Extract images and prompts
+        images = []
+        prompts = []
+        for item in batch:
+            if isinstance(item, dict):
+                images.append(item["image"])
+                prompts.append(item.get("prompt") or self.prompt)
+            else:
+                images.append(item)
+                prompts.append(self.prompt)
+        
+        # Build messages for each image
+        all_messages = [
+            [
+                {"role": "system", "content": [{"type": "text", "text": self.system_prompt}]},
+                {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": prompt}]}
+            ]
+            for img, prompt in zip(images, prompts)
+        ]
+        
+        # Apply chat template (tokenize=False for batching)
+        texts = [
+            self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+            for msg in all_messages
+        ]
+        
+        # Batch process with padding
+        inputs = self.processor(text=texts, images=images, padding=True, return_tensors="pt")
+        
+        if self._inference_dtype:
+            inputs = inputs.to(self.model.device, dtype=self._inference_dtype)
+        else:
+            inputs = inputs.to(self.model.device)
+        
+        # Generate
+        with torch.inference_mode():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.processor.tokenizer.eos_token_id
+            )
+        
+        # Decode generated tokens only
+        generated_ids = [
+            output_ids[i][len(inputs.input_ids[i]):]
+            for i in range(len(images))
+        ]
+        
+        output_texts = self.processor.batch_decode(
+            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+        )
+        
+        return [self._format_output(text) for text in output_texts]
+
+    def _predict(self, image: Image.Image, prompt: str) -> Union[fo.Classifications, str]:
+        """Single image inference."""
         messages = [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": self.system_prompt}]
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image", "image": image}
-                ]
-            }
+            {"role": "system", "content": [{"type": "text", "text": self.system_prompt}]},
+            {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}
         ]
 
         inputs = self.processor.apply_chat_template(
-            messages, 
-            tokenize=True, 
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
+            messages, tokenize=True, add_generation_prompt=True,
+            return_tensors="pt", return_dict=True
         )
         
-        # Move to device with appropriate dtype for floating point tensors
-        # BatchFeature's .to() method intelligently handles dtypes:
-        # - Integer tensors (input_ids) stay as Long
-        # - Floating point tensors (pixel_values) convert to specified dtype
-        if self._inference_dtype is not None:
-            inputs = inputs.to(self.device, dtype=self._inference_dtype)
+        if self._inference_dtype:
+            inputs = inputs.to(self.model.device, dtype=self._inference_dtype)
         else:
-            inputs = inputs.to(self.device)
+            inputs = inputs.to(self.model.device)
 
         input_len = inputs["input_ids"].shape[-1]
 
         with torch.inference_mode():
             generation = self.model.generate(
                 **inputs, 
-                max_new_tokens=8192, 
+                max_new_tokens=self.max_new_tokens, 
                 do_sample=False,
                 pad_token_id=self.processor.tokenizer.eos_token_id
             )
             generation = generation[0][input_len:]
 
         output_text = self.processor.decode(generation, skip_special_tokens=True)
-        return output_text
+        return self._format_output(output_text)
 
-    def _format_output(self, output_text: str) -> Union[fo.Classifications, str]:
-        """Format model output based on operation type.
+    def predict(self, image, sample=None):
+        """Process an image with the model."""
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
         
-        Args:
-            output_text: Raw text output from the model
-            
-        Returns:
-            fo.Classifications for classify operation, str for VQA
-        """
-        if self.operation == "vqa":
-            return output_text.strip()
-        elif self.operation == "classify":
-            parsed_output = self._parse_json(output_text)
-            return self._to_classifications(parsed_output)
-        else:
-            return output_text.strip()
-
-    # ============ PREDICTION METHODS ============
-
-    def predict_all(self, batch, samples=None):
-        """Process a batch of images through the model.
+        prompt = self.prompt
+        if sample is not None and self._get_field():
+            field_value = sample.get_field(self._get_field())
+            if field_value is not None:
+                prompt = str(field_value)
         
-        This is the main batching method called by FiftyOne when using DataLoader.
-        
-        Args:
-            batch: List of dicts from GetItem, each containing:
-                - "image": PIL Image
-                - "prompt": Per-sample prompt (or None)
-            samples: Optional list of FiftyOne samples (for metadata access)
-        
-        Returns:
-            List of predictions (fo.Classifications for classify, str for VQA)
-        """
-        if not batch:
-            return []
-        
-        results = []
-        
-        for i, item in enumerate(batch):
-            # Handle both dict format (from GetItem) and direct PIL Image
-            if isinstance(item, dict):
-                image = item.get("image")
-                prompt_from_batch = item.get("prompt")
-            else:
-                # Direct PIL Image passed (e.g., from predict())
-                image = item
-                prompt_from_batch = None
-            
-            # Resolve prompt: per-sample > global default
-            resolved_prompt = (
-                prompt_from_batch 
-                if prompt_from_batch is not None 
-                else self.prompt
-            )
-            
-            if resolved_prompt is None:
-                raise ValueError(
-                    "No prompt provided. Either set a global prompt via model.prompt "
-                    "or use prompt_field parameter in apply_model()."
-                )
-            
-            # Run inference
-            output_text = self._run_single_inference(image, resolved_prompt)
-            
-            # Format output based on operation
-            result = self._format_output(output_text)
-            results.append(result)
-        
-        return results
-
-    def predict(self, arg, sample=None):
-        """Process a single image with the model.
-        
-        This method is called in non-batched mode or as a fallback.
-        
-        Args:
-            arg: PIL Image, numpy array, or dict from GetItem
-            sample: Optional FiftyOne sample (passed by FiftyOne when using SamplesMixin)
-            
-        Returns:
-            Model predictions in the appropriate format for the current operation
-        """
-        # Handle different input formats
-        if isinstance(arg, dict):
-            # Already from GetItem (batched mode fallback)
-            batch_item = arg
-        elif isinstance(arg, np.ndarray):
-            # Convert numpy to PIL
-            image = Image.fromarray(arg)
-            
-            # Extract prompt from sample if available (SamplesMixin path)
-            prompt = None
-            if sample is not None and "prompt_field" in self._fields:
-                field_name = self._fields["prompt_field"]
-                if sample.has_field(field_name):
-                    prompt = sample.get_field(field_name)
-            
-            batch_item = {"image": image, "prompt": prompt}
-        else:
-            # Assume PIL Image
-            image = arg
-            
-            # Extract prompt from sample if available (SamplesMixin path)
-            prompt = None
-            if sample is not None and "prompt_field" in self._fields:
-                field_name = self._fields["prompt_field"]
-                if sample.has_field(field_name):
-                    prompt = sample.get_field(field_name)
-            
-            batch_item = {"image": image, "prompt": prompt}
-        
-        # Call batch method with single item
-        results = self.predict_all([batch_item], samples=[sample] if sample else None)
-        return results[0]
+        return self._predict(image, prompt)
