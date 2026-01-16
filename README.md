@@ -1,4 +1,4 @@
-# Implementing MedGemma as a Remote Zoo Model for FiftyOne
+# Implementing MedGemma 1.5 as a Remote Zoo Model for FiftyOne
 
 This repository integrates Google's MedGemma models with FiftyOne, allowing you to easily use these powerful medical AI models for analyzing and classifying medical images in your FiftyOne datasets.
 
@@ -44,7 +44,7 @@ Then register this repository as a custom model source:
 
 ```python
 import fiftyone.zoo as foz
-foz.register_zoo_model_source("https://github.com/harpreetsahota204/medgemma", overwrite=True)
+foz.register_zoo_model_source("https://github.com/harpreetsahota204/medgemma_1_5", overwrite=True)
 ```
 
 ## Usage
@@ -56,7 +56,7 @@ import fiftyone.zoo as foz
 
 # Download the model (only needed once)
 foz.download_zoo_model(
-    "https://github.com/harpreetsahota204/medgemma",
+    "https://github.com/harpreetsahota204/medgemma_1_5",
     model_name="google/medgemma-1.5-4b-it", 
 )
 
