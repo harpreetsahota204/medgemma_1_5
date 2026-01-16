@@ -78,6 +78,22 @@ class MedGemmaGetItem(GetItem):
         """
         self.prompt_field = prompt_field
         super().__init__(field_mapping=field_mapping)
+
+    # =========================================================================
+    # Context manager
+    # =========================================================================
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, *args):
+        """Context manager exit - clear GPU memory."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        return False
     
     @property
     def required_keys(self):
@@ -427,7 +443,8 @@ class medgemma(Model, SamplesMixin, SupportsGetItem, TorchModelMixin):
             generation = self.model.generate(
                 **inputs, 
                 max_new_tokens=8192, 
-                do_sample=False
+                do_sample=False,
+                pad_token_id=self.processor.tokenizer.eos_token_id
             )
             generation = generation[0][input_len:]
 
