@@ -82,8 +82,6 @@ model.operation = "vqa"
 
 ```python
 import fiftyone as fo
-
-
 from fiftyone.utils.huggingface import load_from_hub
 
 dataset = load_from_hub(
@@ -91,7 +89,7 @@ dataset = load_from_hub(
     name="MedXpertQA",
     max_samples=10,
     overwrite=True
-    )
+)
 
 # Set classification parameters
 model.operation = "classify"
@@ -99,7 +97,6 @@ model.prompt = "What medical conditions are visible in this image?"
 
 # Run classification on the dataset
 dataset.apply_model(model, label_field="medgemma_classifications")
-
 ```
 
 ### Visual Question Answering Example
@@ -111,8 +108,50 @@ model.prompt = "Is there evidence of pneumonia in this chest X-ray? Explain your
 
 # Apply to dataset
 dataset.apply_model(model, label_field="pneumonia_assessment")
-
 ```
+
+## Batching for Faster Inference
+
+MedGemma supports efficient batch processing for significantly faster inference on large datasets. Use `batch_size` and `num_workers` parameters:
+
+### Global Prompt with Batching
+
+Set a single prompt that applies to all samples:
+
+```python
+# Get unique labels from your dataset
+body_system_labels = dataset.distinct("modality.label")
+
+model.operation = "classify"
+model.prompt = "As a medical expert your task is to classify this image into exactly one of the following types: " + ", ".join(body_system_labels)
+
+# Apply with batching for faster inference
+dataset.apply_model(
+    model, 
+    label_field="pred_modality",
+    batch_size=64,
+    num_workers=8,
+)
+```
+
+### Per-Sample Prompts with Batching
+
+Use `prompt_field` to read prompts from a field on each sample:
+
+```python
+model.operation = "vqa"
+
+# Each sample uses its own prompt from the "question" field
+dataset.apply_model(
+    model, 
+    label_field="pred_answer",
+    prompt_field="question",
+    batch_size=64,
+    num_workers=8,
+)
+```
+
+This is useful when you have different questions or prompts stored per sample in your dataset.
 
 ### Custom System Prompts
 
@@ -127,6 +166,8 @@ Provide your assessment in JSON format with detailed observations."""
 ## Performance Considerations
 
 - For optimal performance, a CUDA-capable GPU is recommended
+- Use `batch_size` and `num_workers` parameters in `apply_model()` for significantly faster inference on large datasets
+- Typical settings: `batch_size=32-64`, `num_workers=4-8` (adjust based on your GPU memory)
 
 # 👩🏽‍💻 Example notebook
 
@@ -144,3 +185,16 @@ This integration is licensed under the Apache 2.0 License.
 - This integration is designed for research and development purposes
 - Always validate model outputs in clinical contexts
 - Review the [MedGemma documentation](https://developers.google.com/health-ai-developer-foundations/medgemma) for detailed information about the model's capabilities and limitations
+
+## Citation
+
+If you use MedGemma in your research, please cite the [MedGemma Technical Report](https://arxiv.org/abs/2507.05201):
+
+```bibtex
+@article{sellergren2025medgemma,
+  title={MedGemma Technical Report},
+  author={Sellergren, Andrew and Kazemzadeh, Sahar and Jaroensri, Tiam and Kiraly, Atilla and Traverse, Madeleine and Kohlberger, Timo and Xu, Shawn and Jamil, Fayaz and Hughes, Cían and Lau, Charles and others},
+  journal={arXiv preprint arXiv:2507.05201},
+  year={2025}
+}
+```
