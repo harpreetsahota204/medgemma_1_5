@@ -61,20 +61,21 @@ def get_device():
 class MedGemmaGetItem(GetItem):
     """GetItem transform for loading images and extracting per-sample prompts."""
     
-    def __init__(self, field_mapping=None, prompt_field=None):
-        self.prompt_field = prompt_field
+    def __init__(self, field_mapping=None, use_prompt_field=False):
+        # Set before super().__init__() since it accesses required_keys
+        self.use_prompt_field = use_prompt_field
         super().__init__(field_mapping=field_mapping)
     
     @property
     def required_keys(self):
         keys = ["filepath"]
-        if self.prompt_field:
-            keys.append(self.prompt_field)
+        if self.use_prompt_field:
+            keys.append("prompt_field")  # Logical key - FiftyOne maps this to actual field
         return keys
     
     def __call__(self, sample_dict):
         image = Image.open(sample_dict["filepath"]).convert("RGB")
-        prompt = sample_dict.get(self.prompt_field) if self.prompt_field else None
+        prompt = sample_dict.get("prompt_field")  # Access via logical key
         return {"image": image, "prompt": prompt}
 
 
@@ -201,10 +202,12 @@ class medgemma(Model, SupportsGetItem, TorchModelMixin):
     # =========================================================================
 
     def get_item(self):
-        return MedGemmaGetItem(prompt_field=self._get_field())
+        return MedGemmaGetItem(use_prompt_field=self._get_field() is not None)
 
     def build_get_item(self, field_mapping=None):
-        return MedGemmaGetItem(field_mapping=field_mapping, prompt_field=self._get_field())
+        # Check if prompt_field is being used (either from needs_fields or field_mapping)
+        use_prompt = self._get_field() is not None or (field_mapping and "prompt_field" in field_mapping)
+        return MedGemmaGetItem(field_mapping=field_mapping, use_prompt_field=use_prompt)
 
     # =========================================================================
     # Operation and prompt properties
