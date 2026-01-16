@@ -17,7 +17,7 @@ export HF_TOKEN="your_token"
 Or sign-in to Hugging Face via the CLI:
 
 ```bash
-huggingface-cli login
+hf auth login
 ```
 
 
