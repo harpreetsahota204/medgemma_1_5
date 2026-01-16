@@ -245,13 +245,21 @@ class medgemma(Model, SupportsGetItem, TorchModelMixin):
             logger.debug(f"Failed to parse JSON from: {s[:200]}")
             return None
 
-    def _to_classifications(self, data: Optional[Dict]) -> fo.Classifications:
+    def _to_classifications(self, data) -> fo.Classifications:
         """Convert parsed JSON to FiftyOne Classifications."""
         if data is None:
             return fo.Classifications(classifications=[])
         
+        # Handle both formats:
+        # - {"classifications": [{"label": "..."}]}
+        # - [{"label": "..."}]
+        if isinstance(data, list):
+            items = data
+        else:
+            items = data.get("classifications", [])
+        
         classifications = []
-        for cls in data.get("classifications", []):
+        for cls in items:
             if isinstance(cls, dict) and "label" in cls:
                 classifications.append(fo.Classification(label=str(cls["label"])))
         return fo.Classifications(classifications=classifications)
