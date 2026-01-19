@@ -68,7 +68,7 @@ model = foz.load_zoo_model(
 
 ### Setting the Operation Mode
 
-The model supports two main operations:
+The model supports three main operations:
 
 ```python
 # For medical image classification
@@ -76,6 +76,9 @@ model.operation = "classify"
 
 # For visual question answering on medical images
 model.operation = "vqa"
+
+# For anatomical structure and pathology detection
+model.operation = "detect"
 ```
 
 ### Classification Example
@@ -109,6 +112,36 @@ model.prompt = "Is there evidence of pneumonia in this chest X-ray? Explain your
 # Apply to dataset
 dataset.apply_model(model, label_field="pneumonia_assessment")
 ```
+
+### Detection Example
+
+Localize anatomical structures and pathologies in medical images. The model outputs bounding boxes in FiftyOne's `Detections` format.
+
+```python
+# Set detection mode
+model.operation = "detect"
+
+# Get labels to detect (e.g., from ground truth)
+labels = dataset.distinct("detections.detections.label")
+labels_str = ", ".join(labels)
+
+# Prompt for localization
+model.prompt = f"""Locate the following in this scan: {labels_str}. 
+Output the final answer in the format "Final Answer: X" where X is a JSON list of objects. 
+The object needs a "box_2d" and "label" key. 
+If the object is not present in the scan, skip it and don't output anything for that object.
+Answer:"""
+
+# Apply detection
+dataset.apply_model(
+    model,
+    label_field="pred_detection",
+    batch_size=8,
+    num_workers=4,
+)
+```
+
+**Note:** Detection mode automatically applies square padding to preserve aspect ratio, ensuring bounding box coordinates map correctly between model output and the original image.
 
 ## Batching for Faster Inference
 
