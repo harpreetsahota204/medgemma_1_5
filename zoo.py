@@ -41,9 +41,16 @@ DEFAULT_VQA_SYSTEM_PROMPT = """You are an expert radiologist, histopathologist, 
 You may be provided with a simple query, patient history with a complex query, asked to provide a medical diagnosis, or any variety of medical question.
 """
 
+DEFAULT_DETECTION_SYSTEM_PROMPT = """Instructions:
+The following user query will require outputting bounding boxes. The format of bounding boxes coordinates is [y0, x0, y1, x1] where (y0, x0) must be top-left corner and (y1, x1) the bottom-right corner. This implies that x0 < x1 and y0 < y1. Always normalize the x and y coordinates the range [0, 1000], meaning that a bounding box starting at 15% of the image width would be associated with an x coordinate of 150. You MUST output a single parseable json list of objects enclosed into ```json...``` brackets, for instance ```json[{"box_2d": [800, 3, 840, 471], "label": "car"}, {"box_2d": [400, 22, 600, 73], "label": "dog"}]``` is a valid output. Now answer to the user query.
+
+Remember "left" refers to the patient's left side where the heart is and sometimes underneath an L in the upper right corner of the image.
+"""
+
 MEDGEMMA_OPERATIONS = {
     "vqa": DEFAULT_VQA_SYSTEM_PROMPT,
-    "classify": DEFAULT_CLASSIFICATION_SYSTEM_PROMPT
+    "classify": DEFAULT_CLASSIFICATION_SYSTEM_PROMPT,
+    "detect": DEFAULT_DETECTION_SYSTEM_PROMPT
 }
 
 logger = logging.getLogger(__name__)
@@ -58,12 +65,44 @@ def get_device():
     return "cpu"
 
 
+def pad_image_to_square(image: Image.Image) -> Image.Image:
+    """Pad image to square to preserve aspect ratio during model resize.
+    
+    Required for detection tasks where bounding box coordinates must map
+    correctly between model output (normalized 0-1000) and original image.
+    """
+    image_array = np.array(image)
+    
+    # Handle grayscale
+    if len(image_array.shape) < 3:
+        image_array = np.stack([image_array] * 3, axis=-1)
+    # Handle RGBA
+    if image_array.shape[2] == 4:
+        image_array = image_array[:, :, :3]
+    
+    h, w = image_array.shape[:2]
+    
+    if h < w:
+        dh = w - h
+        image_array = np.pad(
+            image_array, ((dh // 2, dh - dh // 2), (0, 0), (0, 0))
+        )
+    elif w < h:
+        dw = h - w
+        image_array = np.pad(
+            image_array, ((0, 0), (dw // 2, dw - dw // 2), (0, 0))
+        )
+    
+    return Image.fromarray(image_array)
+
+
 class MedGemmaGetItem(GetItem):
     """GetItem transform for loading images and extracting per-sample prompts."""
     
-    def __init__(self, field_mapping=None, use_prompt_field=False):
+    def __init__(self, field_mapping=None, use_prompt_field=False, operation=None):
         # Set before super().__init__() since it accesses required_keys
         self.use_prompt_field = use_prompt_field
+        self.operation = operation
         super().__init__(field_mapping=field_mapping)
     
     @property
@@ -75,6 +114,11 @@ class MedGemmaGetItem(GetItem):
     
     def __call__(self, sample_dict):
         image = Image.open(sample_dict["filepath"]).convert("RGB")
+        
+        # Square padding for detection to preserve aspect ratio
+        if self.operation == "detect":
+            image = pad_image_to_square(image)
+        
         prompt = sample_dict.get("prompt_field")  # Access via logical key
         return {"image": image, "prompt": prompt}
 
@@ -202,12 +246,19 @@ class medgemma(Model, SupportsGetItem, TorchModelMixin):
     # =========================================================================
 
     def get_item(self):
-        return MedGemmaGetItem(use_prompt_field=self._get_field() is not None)
+        return MedGemmaGetItem(
+            use_prompt_field=self._get_field() is not None,
+            operation=self.operation
+        )
 
     def build_get_item(self, field_mapping=None):
         # Check if prompt_field is being used (either from needs_fields or field_mapping)
         use_prompt = self._get_field() is not None or (field_mapping and "prompt_field" in field_mapping)
-        return MedGemmaGetItem(field_mapping=field_mapping, use_prompt_field=use_prompt)
+        return MedGemmaGetItem(
+            field_mapping=field_mapping,
+            use_prompt_field=use_prompt,
+            operation=self.operation
+        )
 
     # =========================================================================
     # Operation and prompt properties
@@ -264,10 +315,53 @@ class medgemma(Model, SupportsGetItem, TorchModelMixin):
                 classifications.append(fo.Classification(label=str(cls["label"])))
         return fo.Classifications(classifications=classifications)
 
-    def _format_output(self, output_text: str) -> Union[fo.Classifications, str]:
+    def _to_detections(self, data) -> fo.Detections:
+        """Convert parsed JSON to FiftyOne Detections.
+        
+        Model outputs bounding boxes as [y0, x0, y1, x1] normalized to [0, 1000].
+        FiftyOne expects [x, y, width, height] normalized to [0, 1].
+        """
+        if data is None:
+            return fo.Detections(detections=[])
+        
+        # Handle both list format and wrapped format
+        if isinstance(data, list):
+            items = data
+        else:
+            items = data.get("detections", [])
+        
+        detections = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            
+            box_2d = item.get("box_2d")
+            label = item.get("label", "object")
+            
+            if box_2d and len(box_2d) == 4:
+                # Model format: [y0, x0, y1, x1] normalized to 0-1000
+                y0, x0, y1, x1 = box_2d
+                
+                # Convert to FiftyOne format: [x, y, width, height] normalized to 0-1
+                x = x0 / 1000.0
+                y = y0 / 1000.0
+                width = (x1 - x0) / 1000.0
+                height = (y1 - y0) / 1000.0
+                
+                detection = fo.Detection(
+                    label=str(label),
+                    bounding_box=[x, y, width, height]
+                )
+                detections.append(detection)
+        
+        return fo.Detections(detections=detections)
+
+    def _format_output(self, output_text: str) -> Union[fo.Classifications, fo.Detections, str]:
         """Format model output based on operation type."""
         if self.operation == "classify":
             return self._to_classifications(self._parse_json(output_text))
+        elif self.operation == "detect":
+            return self._to_detections(self._parse_json(output_text))
         return output_text.strip()
 
     # =========================================================================
@@ -336,7 +430,7 @@ class medgemma(Model, SupportsGetItem, TorchModelMixin):
         
         return [self._format_output(text) for text in output_texts]
 
-    def _predict(self, image: Image.Image, prompt: str) -> Union[fo.Classifications, str]:
+    def _predict(self, image: Image.Image, prompt: str) -> Union[fo.Classifications, fo.Detections, str]:
         """Single image inference."""
         messages = [
             {"role": "system", "content": [{"type": "text", "text": self.system_prompt}]},
@@ -371,6 +465,10 @@ class medgemma(Model, SupportsGetItem, TorchModelMixin):
         """Process an image with the model."""
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
+        
+        # Square padding for detection to preserve aspect ratio
+        if self.operation == "detect":
+            image = pad_image_to_square(image)
         
         prompt = self.prompt
         if sample is not None and self._get_field():
