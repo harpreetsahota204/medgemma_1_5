@@ -1,5 +1,9 @@
 # Implementing MedGemma 1.5 as a Remote Zoo Model for FiftyOne
 
+![Eval MedGemma Classifications](https://raw.githubusercontent.com/harpreetsahota204/medgemma_kaggle_competition/main/gifs/medgemma_eval_detections.gif)
+
+
+
 This repository integrates Google's MedGemma models with FiftyOne, allowing you to easily use these powerful medical AI models for analyzing and classifying medical images in your FiftyOne datasets.
 
 # ℹ️  Important! Be sure to request access to the model!
