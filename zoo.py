@@ -41,10 +41,10 @@ DEFAULT_VQA_SYSTEM_PROMPT = """You are an expert radiologist, histopathologist, 
 You may be provided with a simple query, patient history with a complex query, asked to provide a medical diagnosis, or any variety of medical question.
 """
 
-DEFAULT_DETECTION_SYSTEM_PROMPT = """Instructions:
-The following user query will require outputting bounding boxes. The format of bounding boxes coordinates is [y0, x0, y1, x1] where (y0, x0) must be top-left corner and (y1, x1) the bottom-right corner. This implies that x0 < x1 and y0 < y1. Always normalize the x and y coordinates the range [0, 1000], meaning that a bounding box starting at 15% of the image width would be associated with an x coordinate of 150. You MUST output a single parseable json list of objects enclosed into ```json...``` brackets, for instance ```json[{"box_2d": [800, 3, 840, 471], "label": "car"}, {"box_2d": [400, 22, 600, 73], "label": "dog"}]``` is a valid output. Now answer to the user query.
-
-Remember "left" refers to the patient's left side where the heart is and sometimes underneath an L in the upper right corner of the image.
+DEFAULT_DETECTION_SYSTEM_PROMPT = """Instructions: The following user query will require outputting bounding boxes. The format of bounding boxes coordinates is [y0, x0, y1, x1] where (y0, x0) must be top-left corner and (y1, x1) the bottom-right corner. 
+This implies that x0 < x1 and y0 < y1. Always normalize the x and y coordinates the range [0, 1000], meaning that a bounding box starting at 15% of the image width would be associated with an x coordinate of 150. 
+You MUST output a single parseable json list of objects enclosed into ```json...``` brackets, for instance ```json[{"box_2d": [y0, x0, y1, x1], "label": "<label>"}, {"box_2d": [y0, x0, y1, x1], "<label>": "dog"}]``` is a valid output. 
+Now answer to the user query.
 """
 
 MEDGEMMA_OPERATIONS = {
